@@ -1,26 +1,44 @@
 mod vectordb;
 
+use ndarray::array;
 use vectordb::vectorstore::VectorDB;
 use vectordb::vectorstore::Vector;
-use rand::Rng;
+use crate::vectordb::vectorstore::DistanceMetric;
 
 fn main() {
+    // Create a new vector database
     let mut db = VectorDB::new();
 
-    // Populate db with random vectors
-    let mut rng = rand::thread_rng();
-    for id in 0..1000 {
-        let v: Vector = (0..128).map(|_| rng.gen_range(0.0..1.0)).collect();
-        let metadata = format!("Document: {}", id);
-        db.add_document(id, v, metadata);
+    // Add some documents with vectors
+    db.add_document(1, array![1.0, 2.0, 3.0], String::from("Document 1"));
+    db.add_document(2, array![4.0, 5.0, 6.0], String::from("Document 2"));
+    db.add_document(3, array![7.0, 8.0, 9.0], String::from("Document 3"));
+
+    // Query for the nearest neighbors to a vector using Euclidean distance
+    let query_vector: Vector = array![1.0, 2.0, 3.5];
+    let nearest_neighbors = db.find_nearest(&query_vector, 2, DistanceMetric::Euclidean);
+
+    // Print out the nearest neighbors
+    println!("Nearest neighbors (Euclidean):");
+    for (id, distance, metadata) in &nearest_neighbors {
+        println!("ID: {}, Distance: {:.4}, Metadata: {}", id, distance, metadata);
     }
 
-    // Query Vector
-    let query_vector: Vector = (0..128).map(|_| rng.gen_range(0.0..1.0)).collect();
+    // Query for the nearest neighbors to a vector using Cosine similarity
+    let nearest_neighbors_cosine = db.find_nearest(&query_vector, 2, DistanceMetric::Cosine);
 
-    // Find the top 5 nearest vectors
-    let results = db.find_nearest(&query_vector, 5);
-    for (id, distance, metadata) in results {
-        println!("Document ID: {}, Distance: {}, Metadata: {}", id, distance, metadata);
+    // Print out the nearest neighbors
+    println!("\nNearest neighbors (Cosine):");
+    for (id, distance, metadata) in &nearest_neighbors_cosine {
+        println!("ID: {}, Distance: {:.4}, Metadata: {}", id, distance, metadata);
+    }
+
+    // Query for the nearest neighbors to a vector using Dot Product
+    let nearest_neighbors_dot = db.find_nearest(&query_vector, 2, DistanceMetric::DotProduct);
+
+    // Print out the nearest neighbors
+    println!("\nNearest neighbors (Dot Product):");
+    for (id, distance, metadata) in &nearest_neighbors_dot {
+        println!("ID: {}, Distance: {:.4}, Metadata: {}", id, distance, metadata);
     }
 }

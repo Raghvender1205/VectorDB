@@ -13,3 +13,10 @@ A vector database implementation in Rust.
 3. Use advanced datastructures for fast nearest neighbor searches.
 4. Adding concurrency for handling multiple queries simultaneously
 5. Scaling up with a distributed system approach.
+
+### Some more options
+1. Currently, your VectorDB uses Euclidean distance. You can add support for other distance metrics like Cosine similarity and Dot Product.
+2. Combine vector search with metadata filtering to allow users to filter results based on additional criteria stored in the `Document` metadata.
+3. Batch import and Export of Documents: you might need to import or export large numbers of documents.
+4. Persistent Storage.
+5. Dynamic Indexing 
