@@ -36,8 +36,27 @@ impl VectorDB {
     }
 
     // Find the top N nearest neighbors to a given vector
-    pub fn find_nearest(&self, query: &Vector, n: usize, metric: DistanceMetric) -> Vec<(i32, f64, String)> {
-        let mut distances: Vec<(i32, f64, String)> = self.documents.values().map(|doc| {
+    pub fn find_nearest(
+        &self,
+        query: &Vector,
+        n: usize,
+        metric: DistanceMetric,
+        metadata_filter: Option<&str>
+    ) -> Vec<(i32, f64, String)> {
+        // Filter documents based on metadata filter if provided
+        let filtered_documents: Vec<&Document> = self.documents.values()
+            .filter(|doc| {
+                if let Some(filter) = metadata_filter {
+                    doc.metadata.contains(filter)
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+
+        // Calculate distances for the filtered documents
+        let mut distances: Vec<(i32, f64, String)> = filtered_documents.iter().map(|doc| {
             let distance = match metric {
                 DistanceMetric::Euclidean => (query - &doc.embedding).mapv(|a| a.powi(2)).sum().sqrt(),
                 DistanceMetric::Cosine => {
