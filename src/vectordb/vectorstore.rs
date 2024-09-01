@@ -15,7 +15,6 @@ pub enum DistanceMetric {
     DotProduct,
 }
 
-
 pub struct VectorDB {
     documents: HashMap<i32, Document>,
 }
@@ -35,7 +34,7 @@ impl VectorDB {
         };
         self.documents.insert(id, document);
     }
-    
+
     // Find the top N nearest neighbors to a given vector
     pub fn find_nearest(&self, query: &Vector, n: usize, metric: DistanceMetric) -> Vec<(i32, f64, String)> {
         let mut distances: Vec<(i32, f64, String)> = self.documents.values().map(|doc| {
@@ -57,3 +56,4 @@ impl VectorDB {
         distances
     }
 }
+
