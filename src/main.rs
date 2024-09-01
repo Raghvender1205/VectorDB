@@ -1,26 +1,25 @@
 mod vectordb;
 
+use ndarray::array;
 use vectordb::vectorstore::VectorDB;
-use vectordb::vectorstore::Vector;
-use rand::Rng;
+use crate::vectordb::vectorstore::DistanceMetric;
 
 fn main() {
+    // Create a new vector database
     let mut db = VectorDB::new();
 
-    // Populate db with random vectors
-    let mut rng = rand::thread_rng();
-    for id in 0..1000 {
-        let v: Vector = (0..128).map(|_| rng.gen_range(0.0..1.0)).collect();
-        db.add_vector(id, v);
-    }
+    // Add some documents with vectors and metadata
+    db.add_document(1, array![1.0, 2.0, 3.0], String::from("Category: A"));
+    db.add_document(2, array![4.0, 5.0, 6.0], String::from("Category: B"));
+    db.add_document(3, array![7.0, 8.0, 9.0], String::from("Category: A"));
 
-    // Query Vector
-    let query_vector: Vector = (0..128).map(|_| rng.gen_range(0.0..1.0)).collect();
+    // Query for the nearest neighbors to a vector with metadata filtering
+    let query_vector = array![1.5, 2.5, 3.5];
+    let nearest_neighbors = db.find_nearest(&query_vector, 2, DistanceMetric::Euclidean, Some("Category: A"));
 
-    // Find nearest vector
-    if let Some((id, distance)) = db.find_nearest(&query_vector) {
-        println!("Nearest vector ID: {} with distance: {}", id, distance);
-    } else {
-        println!("No vectors found");
+    // Print out the nearest neighbors
+    println!("Nearest neighbors (Euclidean with Category: A):");
+    for (id, distance, metadata) in nearest_neighbors {
+        println!("ID: {}, Distance: {:.4}, Metadata: {}", id, distance, metadata);
     }
 }
