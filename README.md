@@ -1,5 +1,5 @@
 # VectorDB
-<div style="text-align: justify;">
+<div align="center">
     <img src="assets/logo.png" width="400" />
 </div>
 
