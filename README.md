@@ -1,5 +1,7 @@
 # VectorDB
-A vector database implementation in Rust.
+A vector database implementation in Rust. A server and client based codebase. Just run the server and call the api endpoints to
+1. embed documents
+2. Search through.
 
 
 ## Features
@@ -13,6 +15,8 @@ A vector database implementation in Rust.
 3. Use advanced datastructures for fast nearest neighbor searches.
 4. Adding concurrency for handling multiple queries simultaneously
 5. Scaling up with a distributed system approach.
+6. Add more logs in server
+7. More robust structure.
 
 ### Some more options
 1. Currently, your VectorDB uses Euclidean distance. You can add support for other distance metrics like Cosine similarity and Dot Product.
