@@ -1,6 +1,8 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::middleware::Logger;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use env_logger::Env;
 use vectordb::vectorstore::{VectorDB, ShardDB, DistanceMetric};
 
 mod vectordb;
@@ -66,11 +68,16 @@ async fn find_nearest(db: web::Data<ShardDB>, item: web::Json<FindNearestRequest
 async fn main() -> std::io::Result<()> {
     // Init vectordb 
     let db = Arc::new(Mutex::new(VectorDB::new()));
+
+    // Initialize logger
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+
     println!("Starting VectorDB server at http://127.0.0.1:8444");
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(db.clone()))
+            .wrap(Logger::default()) // Enable logging middleware
+            .app_data(web::Data::new(db.clone())) // TODO: Maybe increase payload size ?
             .route("/add_document", web::post().to(add_document))
             .route("/find_nearest", web::post().to(find_nearest))
     })
