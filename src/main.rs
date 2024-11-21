@@ -2,7 +2,6 @@ use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use vectordb::vectorstore::{VectorDB, ShardDB, DistanceMetric};
-use vectordb::vectorstore::DistanceMetric::{Cosine, Euclidean, DotProduct};
 
 mod vectordb;
 

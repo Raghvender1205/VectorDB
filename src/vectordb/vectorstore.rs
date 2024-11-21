@@ -3,8 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub type Vector = Array1<f64>;
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Document {
     pub id: i32,
