@@ -15,6 +15,7 @@ struct AddDocumentRequest {
     id: i32,
     embedding: Vec<f64>,
     metadata: String,
+    content: String,
 }
 
 #[derive(Deserialize)]
@@ -35,11 +36,12 @@ struct NearestNeighbor {
     id: i32,
     distance: f64,
     metadata: String,
+    content: String,
 }
 
 async fn add_document(db: web::Data<ShardDB>, item: web::Json<AddDocumentRequest>) -> impl Responder {
     let db = db.lock().unwrap();
-    match db.add_document(item.id, item.embedding.clone(), item.metadata.clone()).await {
+    match db.add_document(item.id, item.embedding.clone(), item.metadata.clone(), item.content.clone()).await {
         Ok(_) => HttpResponse::Ok().body("Document embedded successfully"),
         Err(err) => HttpResponse::BadRequest().body(err),
     }
@@ -50,7 +52,7 @@ async fn add_documents(db: web::Data<ShardDB>, item: web::Json<AddDocumentsReque
     let mut errors = Vec::new();
 
     for doc in &item.documents {
-        if let Err(e) = db.add_document(doc.id, doc.embedding.clone(), doc.metadata.clone()).await {
+        if let Err(e) = db.add_document(doc.id, doc.embedding.clone(), doc.metadata.clone(), doc.content.clone()).await {
             errors.push(format!("Failed to add document ID {}: {}", doc.id, e));
         }
     }
@@ -82,8 +84,8 @@ async fn retrieve_documents(db: web::Data<ShardDB>, item: web::Json<FindNearestR
         item.metadata_filter.as_deref(),
     ).await;
 
-    let response: Vec<NearestNeighbor> = results.into_iter().map(|(id, distance, metadata)| {
-        NearestNeighbor { id, distance, metadata }
+    let response: Vec<NearestNeighbor> = results.into_iter().map(|(id, distance, metadata, content)| {
+        NearestNeighbor { id, distance, metadata, content }
     }).collect();
 
     HttpResponse::Ok().json(response)
