@@ -77,6 +77,16 @@ def main():
 
     print("All documents processed.")
 
+    # Test search functionality
+    question = input("Ask: ")
+    query = embeddings.embed_documents([question])[0]
+    retreived_docs = client.find_nearest(query=query, n=5, metric="Cosine", metadata_filter="pdf_document")
+    if retreived_docs:
+        for docs in retreived_docs:
+            print(f"ID: {docs['id']}, Distance: {docs['distance']}, Metadata: {docs['metadata']}")
+    else:
+        print('No documents retrieved')
+
 
 if __name__ == "__main__":
     main()

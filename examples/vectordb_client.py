@@ -32,7 +32,7 @@ class VectorDBClient:
         metric: str = "Dot",
         metadata_filter: Optional[str] = None
     ) -> List[dict]:
-        url = f"{self.server_url}/find_nearest"
+        url = f"{self.server_url}/search"
         payload = {
             "query": query,
             "n": n,
