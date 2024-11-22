@@ -51,7 +51,8 @@ impl VectorDB {
             CREATE TABLE IF NOT EXISTS documents (
                 id INTEGER PRIMARY KEY,
                 embedding TEXT NOT NULL,
-                metadata TEXT NOT NULL
+                metadata TEXT NOT NULL,
+                content TEXT NOT NULL
             );
             "#,
         )
@@ -62,20 +63,21 @@ impl VectorDB {
     }  
 
     /// Adds a new document to the database.
-    pub async fn add_document(&self, id: i32, vector: Vec<f64>, metadata: String) -> Result<(), String> {
+    pub async fn add_document(&self, id: i32, vector: Vec<f64>, metadata: String, content: String) -> Result<(), String> {
         // Serialize the embedding vector to JSON string
         let embedding_json = serde_json::to_string(&vector).map_err(|e| e.to_string())?;
 
         // Insert to db
         let result = sqlx::query(
             r#"
-            INSERT INTO documents (id, embedding, metadata)
-            VALUES (?, ?, ?)
+            INSERT INTO documents (id, embedding, metadata, content)
+            VALUES (?, ?, ?, ?)
             "#,
         )
         .bind(id)
         .bind(embedding_json)
         .bind(metadata)
+        .bind(content)
         .execute(&self.pool)
         .await;
 
@@ -92,9 +94,9 @@ impl VectorDB {
         n: usize, // top n 
         metric: DistanceMetric,
         metadata_filter: Option<&str>,
-    ) -> Vec<(i32, f64, String)> {
+    ) -> Vec<(i32, f64, String, String)> {
         // Sql for optional metadata filtering
-        let mut query_builder = String::from("SELECT id, embedding, metadata FROM documents");
+        let mut query_builder = String::from("SELECT id, embedding, metadata, content FROM documents");
         if let Some(_filter) = metadata_filter {
             query_builder.push_str(" WHERE metadata LIKE ?"); // TODO: Test it!!
         }
@@ -122,6 +124,7 @@ impl VectorDB {
             let id: i32 = row.try_get("id").unwrap_or(0);
             let embedding_str: String = row.try_get("embedding").unwrap_or_default();
             let metadata: String = row.try_get("metadata").unwrap_or_default();
+            let content: String = row.try_get("content").unwrap_or_default();
 
             // Deserialize the embedding
             let embedding: Vec<f64> = match serde_json::from_str(&embedding_str) {
@@ -149,7 +152,7 @@ impl VectorDB {
                 DistanceMetric::DotProduct => query_vec.dot(&doc_vec),
             };
 
-            distances.push((id, distance, metadata));
+            distances.push((id, distance, metadata, content));
         }
 
         // Sort by distance and return top N
