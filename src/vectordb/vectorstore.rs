@@ -95,7 +95,7 @@ impl VectorDB {
     ) -> Vec<(i32, f64, String)> {
         // Sql for optional metadata filtering
         let mut query_builder = String::from("SELECT id, embedding, metadata FROM documents");
-        if let Some(filter) = metadata_filter {
+        if let Some(_filter) = metadata_filter {
             query_builder.push_str(" WHERE metadata LIKE ?"); // TODO: Test it!!
         }
 
