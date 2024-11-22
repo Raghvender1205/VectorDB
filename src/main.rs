@@ -96,7 +96,7 @@ fn initialize_database_path() -> std::io::Result<String> {
     let db_path_str = db_path.to_str()
         .expect("Invalid path")
         .replace("\\", "/");
-    Ok(format!("sqlite:///{}", db_path_str))
+    Ok(format!("sqlite://{}", db_path_str))
 }
 
 
