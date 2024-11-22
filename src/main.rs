@@ -18,6 +18,11 @@ struct AddDocumentRequest {
 }
 
 #[derive(Deserialize)]
+struct AddDocumentsRequest {
+    documents: Vec<AddDocumentRequest>,
+}
+
+#[derive(Deserialize)]
 struct FindNearestRequest {
     query: Vec<f64>,
     n: usize,
@@ -37,6 +42,23 @@ async fn add_document(db: web::Data<ShardDB>, item: web::Json<AddDocumentRequest
     match db.add_document(item.id, item.embedding.clone(), item.metadata.clone()).await {
         Ok(_) => HttpResponse::Ok().body("Document embedded successfully"),
         Err(err) => HttpResponse::BadRequest().body(err),
+    }
+}
+
+async fn add_documents(db: web::Data<ShardDB>, item: web::Json<AddDocumentsRequest>) -> impl Responder {
+    let db = db.lock().unwrap();
+    let mut errors = Vec::new();
+
+    for doc in &item.documents {
+        if let Err(e) = db.add_document(doc.id, doc.embedding.clone(), doc.metadata.clone()).await {
+            errors.push(format!("Failed to add document ID {}: {}", doc.id, e));
+        }
+    }
+
+    if errors.is_empty() {
+        HttpResponse::Ok().body("All documents embedded successfully")
+    } else {
+        HttpResponse::BadRequest().body(errors.join("\n"))
     }
 }
 
@@ -147,6 +169,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::default()) // Enable logging middleware
             .app_data(web::Data::new(db.clone())) // TODO: Maybe increase payload size ?
             .route("/add_document", web::post().to(add_document))
+            .route("/add_documents", web::post().to(add_documents))
             .route("/search", web::post().to(retrieve_documents))
     })
     .bind(("127.0.0.1", 8444))?
