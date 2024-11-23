@@ -5,11 +5,21 @@ use sqlx::Row;
 use std::sync::{Arc, Mutex};
 use std::vec;
 
+use crate::AddDocumentRequest;
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Collection {
+    pub id: i32,
+    pub name: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Document {
     pub id: i32,
     pub embedding: Vec<f64>, // Vec<f64> for better serialization
     pub metadata: String,
+    pub content: String,
+    pub collection_id: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -45,6 +55,18 @@ impl VectorDB {
             .connect(database_url)
             .await?;
 
+        // Create collections table if it doesn't exist
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS collections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
         // Create the documents table if it doesn't exist
         sqlx::query(
             r#"
@@ -52,7 +74,9 @@ impl VectorDB {
                 id INTEGER PRIMARY KEY,
                 embedding TEXT NOT NULL,
                 metadata TEXT NOT NULL,
-                content TEXT NOT NULL
+                content TEXT NOT NULL,
+                collection_id INTEGER NOT NULL,
+                FOREIGN KEY (collection_id) REFERENCES collections(id)
             );
             "#,
         )
@@ -62,22 +86,98 @@ impl VectorDB {
         Ok(VectorDB { pool })
     }  
 
+    /// Creates a new collection
+    pub async fn create_collection(&self, name: &str) -> Result<Collection, String> {
+        // Insert the new collection
+        let result = sqlx::query(
+            r#"
+            INSERT INTO collections (name)
+            VALUES (?)
+            "#,
+        )
+        .bind(name)
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(res) => {
+                let collection_id = res.last_insert_rowid() as i32;
+                Ok(Collection {
+                    id: collection_id,
+                    name: name.to_string(),
+                })
+            }
+            Err(e) => {
+                if let sqlx::Error::Database(db_err) = &e {
+                    if db_err.message().contains("UNIQUE constraint failed") {
+                        return Err("Collection already exists".to_string());
+                    }
+                }
+                Err(e.to_string())
+            }
+        }
+    }
+
+    /// Retrieves a collection by name.
+    pub async fn get_collection_by_name(&self, name: &str) -> Result<Collection, String> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, name FROM collections
+            WHERE name = ?
+            "#,
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        Ok(Collection {
+            id: row.try_get("id").unwrap_or(0),
+            name: row.try_get("name").unwrap_or_default(),
+        })
+    }
+
+    /// Check if a collection exists
+    #[allow(dead_code)] // Suppress warning if not used
+    pub async fn collection_exists(&self, name: &str) -> bool {
+        let result = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*) FROM collections
+            WHERE name = ?
+            "#,
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        result > 0
+    }
+
     /// Adds a new document to the database.
-    pub async fn add_document(&self, id: i32, vector: Vec<f64>, metadata: String, content: String) -> Result<(), String> {
+    pub async fn add_document(
+        &self, 
+        id: i32, 
+        vector: Vec<f64>, 
+        metadata: String, 
+        content: String,
+        collection_id: i32,
+    ) -> Result<(), String> {
         // Serialize the embedding vector to JSON string
         let embedding_json = serde_json::to_string(&vector).map_err(|e| e.to_string())?;
 
         // Insert to db
         let result = sqlx::query(
             r#"
-            INSERT INTO documents (id, embedding, metadata, content)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO documents (id, embedding, metadata, content, collection_id)
+            VALUES (?, ?, ?, ?, ?)
             "#,
         )
         .bind(id)
         .bind(embedding_json)
         .bind(metadata)
         .bind(content)
+        .bind(collection_id)
         .execute(&self.pool)
         .await;
 
@@ -87,24 +187,54 @@ impl VectorDB {
         }
     }
 
+    /// Batch adds multiple documents to the database within a collection
+    pub async fn add_documents(
+        &self,
+        documents: Vec<AddDocumentRequest>,
+        collection_id: i32
+    ) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        for doc in documents {
+            if let Err(e) = self
+                .add_document(
+                    doc.id,
+                    doc.embedding,
+                    doc.metadata,
+                    doc.content,
+                    collection_id,
+                )
+                .await
+            {
+                errors.push(format!("Failed to add document ID {}: {}", doc.id, e));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Finds the top N nearest neighbors to a given query vector
     pub async fn search(
         &self,
         query: &[f64],
         n: usize, // top n 
         metric: DistanceMetric,
-        metadata_filter: Option<&str>,
+        collection_name: Option<&str>,
     ) -> Vec<(i32, f64, String, String)> {
         // Sql for optional metadata filtering
         let mut query_builder = String::from("SELECT id, embedding, metadata, content FROM documents");
-        if let Some(_filter) = metadata_filter {
-            query_builder.push_str(" WHERE metadata LIKE ?"); // TODO: Test it!!
+        if let Some(_filter) = collection_name {
+            query_builder.push_str(" WHERE collection_id = (SELECT id FROM collections WHERE name = ?)");
         }
 
         // Execute
-        let rows = if let Some(filter) = metadata_filter {
+        let rows = if let Some(filter) = collection_name {
             sqlx::query(&query_builder)
-                .bind(format!("%{}%", filter))
+                .bind(filter)
                 .fetch_all(&self.pool)
                 .await
                 .unwrap_or_else(|_| vec![])

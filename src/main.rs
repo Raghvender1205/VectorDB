@@ -10,12 +10,19 @@ use vectordb::vectorstore::{VectorDB, ShardDB, DistanceMetric};
 
 mod vectordb;
 
-#[derive(Deserialize)]
-struct AddDocumentRequest {
-    id: i32,
-    embedding: Vec<f64>,
-    metadata: String,
-    content: String,
+
+#[derive(Deserialize, Clone)]
+pub struct CreateCollectionRequest {
+    pub name: String,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct AddDocumentRequest {
+    pub id: i32,
+    pub embedding: Vec<f64>,
+    pub metadata: String,
+    pub content: String,
+    pub collection_name: String, 
 }
 
 #[derive(Deserialize)]
@@ -24,48 +31,115 @@ struct AddDocumentsRequest {
 }
 
 #[derive(Deserialize)]
-struct FindNearestRequest {
-    query: Vec<f64>,
-    n: usize,
-    metric: String, // "Euclidean", "Cosine", "Dot"
-    metadata_filter: Option<String>,
+pub struct SearchRequest {
+    pub query: Vec<f64>,
+    pub n: usize,
+    pub metric: String, // "Euclidean", "Cosine", "Dot"
+    pub collection_name: String
 }
 
 #[derive(Serialize)]
-struct NearestNeighbor {
-    id: i32,
-    distance: f64,
-    metadata: String,
-    content: String,
+pub struct NearestNeighbor {
+    pub id: i32,
+    pub distance: f64,
+    pub metadata: String,
+    pub content: String,
 }
 
-async fn add_document(db: web::Data<ShardDB>, item: web::Json<AddDocumentRequest>) -> impl Responder {
+/// Handler to create a new collection
+async fn create_collection(
+    db: web::Data<ShardDB>,
+    item: web::Json<CreateCollectionRequest>
+) -> impl Responder {
     let db = db.lock().unwrap();
-    match db.add_document(item.id, item.embedding.clone(), item.metadata.clone(), item.content.clone()).await {
+    match db.create_collection(&item.name).await {
+        Ok(colection) => HttpResponse::Ok().json(colection),
+        Err(err) => {
+            if err == "Collection Already exists" {
+                HttpResponse::Conflict().body("Collection already exists")
+            } else {
+                HttpResponse::BadRequest().body(err)
+            }
+        }
+    }
+}
+
+
+/// Handler to add a single document to a collection
+async fn add_document(
+    db: web::Data<ShardDB>,
+    item: web::Json<AddDocumentRequest>,
+) -> impl Responder {
+    let db = db.lock().unwrap();
+
+    // Retrieve the collection by name
+    let collection = match db.get_collection_by_name(&item.collection_name).await {
+        Ok(col) => col,
+        Err(e) => return HttpResponse::BadRequest().body(format!("Collection not found: {}", e)),
+    };
+
+    match db
+        .add_document(
+            item.id,
+            item.embedding.clone(),
+            item.metadata.clone(),
+            item.content.clone(),
+            collection.id,
+        )
+        .await
+    {
         Ok(_) => HttpResponse::Ok().body("Document embedded successfully"),
         Err(err) => HttpResponse::BadRequest().body(err),
     }
 }
 
-async fn add_documents(db: web::Data<ShardDB>, item: web::Json<AddDocumentsRequest>) -> impl Responder {
-    let db = db.lock().unwrap();
-    let mut errors = Vec::new();
 
+/// Handler to add multiple documents to a collection
+async fn add_documents(
+    db: web::Data<ShardDB>,
+    item: web::Json<AddDocumentsRequest>,
+) -> impl Responder {
+    let db = db.lock().unwrap();
+
+    if item.documents.is_empty() {
+        return HttpResponse::BadRequest().body("No documents provided");
+    }
+
+    // Assuming all documents belong to the same collection
+    let collection_name = &item.documents[0].collection_name;
+
+    // Verify all documents belong to the same collection
     for doc in &item.documents {
-        if let Err(e) = db.add_document(doc.id, doc.embedding.clone(), doc.metadata.clone(), doc.content.clone()).await {
-            errors.push(format!("Failed to add document ID {}: {}", doc.id, e));
+        if doc.collection_name != *collection_name {
+            return HttpResponse::BadRequest().body("All documents must belong to the same collection");
         }
     }
 
-    if errors.is_empty() {
-        HttpResponse::Ok().body("All documents embedded successfully")
-    } else {
-        HttpResponse::BadRequest().body(errors.join("\n"))
+    // Retrieve the collection by name
+    let collection = match db.get_collection_by_name(collection_name).await {
+        Ok(col) => col,
+        Err(_) => return HttpResponse::BadRequest().body("Collection not found"),
+    };
+
+    match db.add_documents(item.documents.clone(), collection.id).await {
+        Ok(_) => HttpResponse::Ok().body("All documents embedded successfully"),
+        Err(errors) => HttpResponse::BadRequest().body(errors.join("\n")),
     }
 }
 
-async fn retrieve_documents(db: web::Data<ShardDB>, item: web::Json<FindNearestRequest>) -> impl Responder {
+
+/// Handler to search for relevant documents within a collection
+async fn retrieve_documents(
+    db: web::Data<ShardDB>,
+    item: web::Json<SearchRequest>,
+) -> impl Responder {
     let db = db.lock().unwrap();
+
+    // Retrieve the collection by name
+    let collection = match db.get_collection_by_name(&item.collection_name).await {
+        Ok(col) => col,
+        Err(_) => return HttpResponse::BadRequest().body("Collection not found"),
+    };
 
     // Parse the distance metric
     let metric = match DistanceMetric::from_str(&item.metric) {
@@ -77,21 +151,30 @@ async fn retrieve_documents(db: web::Data<ShardDB>, item: web::Json<FindNearestR
         return HttpResponse::BadRequest().body("Query vector is empty");
     }
 
-    let results = db.search(
-        &item.query,
-        item.n,
-        metric,
-        item.metadata_filter.as_deref(),
-    ).await;
+    let results = db
+        .search(
+            &item.query,
+            item.n,
+            metric,
+            Some(&collection.name),
+        )
+        .await;
 
-    let response: Vec<NearestNeighbor> = results.into_iter().map(|(id, distance, metadata, content)| {
-        NearestNeighbor { id, distance, metadata, content }
-    }).collect();
+    let response: Vec<NearestNeighbor> = results
+        .into_iter()
+        .map(|(id, distance, metadata, content)| NearestNeighbor {
+            id,
+            distance,
+            metadata,
+            content,
+        })
+        .collect();
 
     HttpResponse::Ok().json(response)
 }
 
 
+/// Ensures that a directory exists, creating it if necessary
 fn ensure_directory(path: &PathBuf) -> std::io::Result<()> {
     if !path.exists() {
         fs::create_dir_all(path)?;
@@ -102,6 +185,8 @@ fn ensure_directory(path: &PathBuf) -> std::io::Result<()> {
     Ok(())
 }
 
+
+/// Initializes the database path, ensuring correct formatting and directory structure
 fn initialize_database_path() -> std::io::Result<String> {
     // Get the current working directory instead of executable path
     let current_dir = env::current_dir()?;
@@ -120,7 +205,7 @@ fn initialize_database_path() -> std::io::Result<String> {
     let db_path_str = db_path.to_str()
         .expect("Invalid path")
         .replace("\\", "/");
-    Ok(format!("sqlite://{}", db_path_str))
+    Ok(format!("sqlite:///{}", db_path_str)) // Ensure three slashes for absolute path
 }
 
 
@@ -146,9 +231,10 @@ async fn main() -> std::io::Result<()> {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Failed to initialize database: {}", e);
-            // Try to create an empty database file if it doesn't exist
-            if !PathBuf::from(database_url.trim_start_matches("sqlite://")).exists() {
-                fs::File::create(database_url.trim_start_matches("sqlite://"))?;
+            // Attempt to create an empty database file if it doesn't exist
+            let db_path = database_url.trim_start_matches("sqlite:///").to_string();
+            if !PathBuf::from(&db_path).exists() {
+                fs::File::create(&db_path)?;
                 // Retry database initialization
                 match VectorDB::new(&database_url).await {
                     Ok(db) => db,
@@ -170,6 +256,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::default()) // Enable logging middleware
             .app_data(web::Data::new(db.clone())) // TODO: Maybe increase payload size ?
+            .route("/create_collection", web::post().to(create_collection))
             .route("/add_document", web::post().to(add_document))
             .route("/add_documents", web::post().to(add_documents))
             .route("/search", web::post().to(retrieve_documents))
