@@ -53,11 +53,18 @@ async fn create_collection(
 ) -> impl Responder {
     let db = db.lock().unwrap();
     match db.create_collection(&item.name).await {
-        Ok(colection) => HttpResponse::Ok().json(colection),
+        Ok(collection) => {
+            log::info!("Created new collection: {}", collection.name);
+            HttpResponse::Ok().json(collection)
+        },
         Err(err) => {
-            if err == "Collection Already exists" {
+            let err_lower = err.to_lowercase();
+            if err_lower.contains("collection already exists") {
+                log::info!("Collection '{}' already exists.", item.name);
+                // Respond with 409 Conflict
                 HttpResponse::Conflict().body("Collection already exists")
             } else {
+                log::error!("Error creating collection '{}': {}", item.name, err);
                 HttpResponse::BadRequest().body(err)
             }
         }
@@ -75,7 +82,10 @@ async fn add_document(
     // Retrieve the collection by name
     let collection = match db.get_collection_by_name(&item.collection_name).await {
         Ok(col) => col,
-        Err(e) => return HttpResponse::BadRequest().body(format!("Collection not found: {}", e)),
+        Err(e) => {
+            log::warn!("Collection '{}' not found: {}", item.collection_name, e);
+            return HttpResponse::BadRequest().body(format!("Collection not found: {}", e));
+        },
     };
 
     match db
@@ -88,8 +98,14 @@ async fn add_document(
         )
         .await
     {
-        Ok(_) => HttpResponse::Ok().body("Document embedded successfully"),
-        Err(err) => HttpResponse::BadRequest().body(err),
+        Ok(_) => {
+            log::info!("Added document ID {} to collection '{}'", item.id, collection.name);
+            HttpResponse::Ok().body("Document embedded successfully")
+        },
+        Err(err) => {
+            log::error!("Error adding document ID {}: {}", item.id, err);
+            HttpResponse::BadRequest().body(err)
+        },
     }
 }
 
@@ -102,6 +118,7 @@ async fn add_documents(
     let db = db.lock().unwrap();
 
     if item.documents.is_empty() {
+        log::warn!("No documents provided for addition.");
         return HttpResponse::BadRequest().body("No documents provided");
     }
 
@@ -111,6 +128,7 @@ async fn add_documents(
     // Verify all documents belong to the same collection
     for doc in &item.documents {
         if doc.collection_name != *collection_name {
+            log::warn!("Document ID {} has mismatched collection name '{}'", doc.id, doc.collection_name);
             return HttpResponse::BadRequest().body("All documents must belong to the same collection");
         }
     }
@@ -118,12 +136,23 @@ async fn add_documents(
     // Retrieve the collection by name
     let collection = match db.get_collection_by_name(collection_name).await {
         Ok(col) => col,
-        Err(_) => return HttpResponse::BadRequest().body("Collection not found"),
+        Err(_) => {
+            log::warn!("Collection '{}' not found.", collection_name);
+            return HttpResponse::BadRequest().body("Collection not found");
+        },
     };
 
     match db.add_documents(item.documents.clone(), collection.id).await {
-        Ok(_) => HttpResponse::Ok().body("All documents embedded successfully"),
-        Err(errors) => HttpResponse::BadRequest().body(errors.join("\n")),
+        Ok(_) => {
+            log::info!("Added {} documents to collection '{}'", item.documents.len(), collection.name);
+            HttpResponse::Ok().body("All documents embedded successfully")
+        },
+        Err(errors) => {
+            for error in &errors {
+                log::error!("Error adding document: {}", error);
+            }
+            HttpResponse::BadRequest().body(errors.join("\n"))
+        },
     }
 }
 
@@ -138,16 +167,23 @@ async fn retrieve_documents(
     // Retrieve the collection by name
     let collection = match db.get_collection_by_name(&item.collection_name).await {
         Ok(col) => col,
-        Err(_) => return HttpResponse::BadRequest().body("Collection not found"),
+        Err(_) => {
+            log::warn!("Collection '{}' not found.", item.collection_name);
+            return HttpResponse::BadRequest().body("Collection not found");
+        },
     };
 
     // Parse the distance metric
     let metric = match DistanceMetric::from_str(&item.metric) {
         Some(m) => m,
-        None => return HttpResponse::BadRequest().body("Invalid Distance metric"),
+        None => {
+            log::warn!("Invalid distance metric: {}", item.metric);
+            return HttpResponse::BadRequest().body("Invalid Distance metric");
+        },
     };
 
     if item.query.is_empty() {
+        log::warn!("Empty query vector provided.");
         return HttpResponse::BadRequest().body("Query vector is empty");
     }
 
@@ -170,6 +206,7 @@ async fn retrieve_documents(
         })
         .collect();
 
+    log::info!("Search completed in collection '{}'. Found {} results.", collection.name, response.len());
     HttpResponse::Ok().json(response)
 }
 
