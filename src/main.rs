@@ -71,6 +71,20 @@ async fn create_collection(
     }
 }
 
+// Handler to get collection by name
+async fn get_collection_by_name(
+    db: web::Data<ShardDB>,
+    path: web::Path<String>,
+) -> impl Responder {
+    let db = db.lock().unwrap();
+    let colletion_name = path.into_inner();
+
+    match db.get_collection_by_name(&colletion_name).await {
+        Ok(collection) => HttpResponse::Ok().json(collection),
+        Err(_) => HttpResponse::NotFound().body("Collection not found")
+    }
+}
+
 
 /// Handler to add a single document to a collection
 async fn add_document(
@@ -294,6 +308,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::default()) // Enable logging middleware
             .app_data(web::Data::new(db.clone())) // TODO: Maybe increase payload size ?
             .route("/create_collection", web::post().to(create_collection))
+            .route("/collections/{name}", web::get().to(get_collection_by_name))
             .route("/add_document", web::post().to(add_document))
             .route("/add_documents", web::post().to(add_documents))
             .route("/search", web::post().to(retrieve_documents))
