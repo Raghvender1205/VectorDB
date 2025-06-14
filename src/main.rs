@@ -18,16 +18,27 @@ pub struct CreateCollectionRequest {
 
 #[derive(Deserialize, Clone)]
 pub struct AddDocumentRequest {
-    pub id: i32,
+    pub id: Option<i32>,
     pub embedding: Vec<f64>,
     pub metadata: String,
     pub content: String,
     pub collection_name: String, 
 }
 
+#[derive(Serialize)]
+struct AddDocumentResponse {
+    id: i32,
+    status: String,
+}
+
 #[derive(Deserialize)]
 struct AddDocumentsRequest {
     documents: Vec<AddDocumentRequest>,
+}
+
+#[derive(Serialize)]
+struct AddDocumentsResponse {
+    documents: Vec<AddDocumentResponse>
 }
 
 #[derive(Deserialize)]
@@ -45,6 +56,12 @@ pub struct NearestNeighbor {
     pub metadata: String,
     pub content: String,
 }
+
+// Healthcheck
+async fn health_check() -> impl Responder {
+    HttpResponse::Ok().body("pong")
+}
+
 
 /// Handler to create a new collection
 async fn create_collection(
@@ -92,37 +109,29 @@ async fn add_document(
     item: web::Json<AddDocumentRequest>,
 ) -> impl Responder {
     let db = db.lock().unwrap();
-
-    // Retrieve the collection by name
     let collection = match db.get_collection_by_name(&item.collection_name).await {
         Ok(col) => col,
-        Err(e) => {
-            log::warn!("Collection '{}' not found: {}", item.collection_name, e);
-            return HttpResponse::BadRequest().body(format!("Collection not found: {}", e));
-        },
+        Err(e) => return HttpResponse::BadRequest().body(format!("Collection not found: {}", e)),
     };
 
-    match db
+    let result = db
         .add_document(
-            item.id,
+            item.id, // <- only if provided
             item.embedding.clone(),
             item.metadata.clone(),
             item.content.clone(),
             collection.id,
         )
-        .await
-    {
-        Ok(_) => {
-            log::info!("Added document ID {} to collection '{}'", item.id, collection.name);
-            HttpResponse::Ok().body("Document embedded successfully")
-        },
-        Err(err) => {
-            log::error!("Error adding document ID {}: {}", item.id, err);
-            HttpResponse::BadRequest().body(err)
-        },
+        .await;
+
+    match result {
+        Ok(new_id) => HttpResponse::Ok().json(AddDocumentResponse {
+            id: new_id,
+            status: "Document embedded successfully".to_string(),
+        }),
+        Err(err) => HttpResponse::BadRequest().body(err),
     }
 }
-
 
 /// Handler to add multiple documents to a collection
 async fn add_documents(
@@ -142,7 +151,10 @@ async fn add_documents(
     // Verify all documents belong to the same collection
     for doc in &item.documents {
         if doc.collection_name != *collection_name {
-            log::warn!("Document ID {} has mismatched collection name '{}'", doc.id, doc.collection_name);
+            log::warn!(
+                "Document with collection mismatch: {:?} vs expected {}",
+                doc.collection_name, collection_name
+            );            
             return HttpResponse::BadRequest().body("All documents must belong to the same collection");
         }
     }
@@ -157,17 +169,32 @@ async fn add_documents(
     };
 
     match db.add_documents(item.documents.clone(), collection.id).await {
-        Ok(_) => {
-            log::info!("Added {} documents to collection '{}'", item.documents.len(), collection.name);
-            HttpResponse::Ok().body("All documents embedded successfully")
-        },
+        Ok(ids) => {
+            let responses = ids.into_iter().map(|id| AddDocumentResponse {
+                id,
+                status: "success".to_string(),
+            }).collect::<Vec<_>>();
+    
+            HttpResponse::Ok().json(AddDocumentsResponse {
+                documents: responses,
+            })
+        }
         Err(errors) => {
-            for error in &errors {
-                log::error!("Error adding document: {}", error);
-            }
-            HttpResponse::BadRequest().body(errors.join("\n"))
-        },
-    }
+            // Handle errors with partial success
+            let responses = item.documents.iter()
+                .filter_map(|doc| doc.id)
+                .map(|id| AddDocumentResponse {
+                    id,
+                    status: "failed".to_string(),
+                })
+                .collect::<Vec<_>>();
+    
+            HttpResponse::MultiStatus().json(serde_json::json!({
+                "documents": responses,
+                "errors": errors
+            }))
+        }
+    }    
 }
 
 
@@ -307,6 +334,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(Logger::default()) // Enable logging middleware
             .app_data(web::Data::new(db.clone())) // TODO: Maybe increase payload size ?
+            .route("/ping", web::get().to(health_check))
             .route("/create_collection", web::post().to(create_collection))
             .route("/collections/{name}", web::get().to(get_collection_by_name))
             .route("/add_document", web::post().to(add_document))
