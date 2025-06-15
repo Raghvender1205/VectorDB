@@ -157,34 +157,44 @@ impl VectorDB {
     /// Adds a new document to the database.
     pub async fn add_document(
         &self, 
-        id: i32, 
+        id: Option<i32>, 
         vector: Vec<f64>, 
         metadata: String, 
         content: String,
         collection_id: i32,
-    ) -> Result<(), String> {
+    ) -> Result<i32, String> {
         // Serialize the embedding vector to JSON string
         let embedding_json = serde_json::to_string(&vector).map_err(|e| e.to_string())?;
 
-        // Insert to db
-        let result = sqlx::query(
-            r#"
-            INSERT INTO documents (id, embedding, metadata, content, collection_id)
-            VALUES (?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(id)
-        .bind(embedding_json)
-        .bind(metadata)
-        .bind(content)
-        .bind(collection_id)
-        .execute(&self.pool)
-        .await;
+        let query = if let Some(id_val) = id {
+            sqlx::query(
+                r#"
+                INSERT INTO documents (id, embedding, metadata, content, collection_id)
+                VALUES (?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(id_val)
+            .bind(embedding_json)
+            .bind(metadata)
+            .bind(content)
+            .bind(collection_id)
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO documents (embedding, metadata, content, collection_id)
+                VALUES (?, ?, ?, ?)
+                "#,
+            )
+            .bind(embedding_json)
+            .bind(metadata)
+            .bind(content)
+            .bind(collection_id)
+        };
 
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.to_string()),
-        }
+        let result = query.execute(&self.pool).await.map_err(|e| e.to_string())?;
+        let inserted_id  = result.last_insert_rowid() as i32;
+        
+        Ok(inserted_id)
     }
 
     /// Batch adds multiple documents to the database within a collection
@@ -192,26 +202,27 @@ impl VectorDB {
         &self,
         documents: Vec<AddDocumentRequest>,
         collection_id: i32
-    ) -> Result<(), Vec<String>> {
+    ) -> Result<Vec<i32>, Vec<String>> {
         let mut errors = Vec::new();
+        let mut inserted_ids = Vec::new();
+
 
         for doc in documents {
-            if let Err(e) = self
-                .add_document(
-                    doc.id,
-                    doc.embedding,
-                    doc.metadata,
-                    doc.content,
-                    collection_id,
-                )
-                .await
+            match self
+            .add_document(doc.id, doc.embedding, doc.metadata, doc.content, collection_id)
+            .await
             {
-                errors.push(format!("Failed to add document ID {}: {}", doc.id, e));
+                Ok(id) => inserted_ids.push(id),
+                Err(e) => errors.push(format!(
+                    "Failed to add document ID {}: {}",
+                    doc.id.map(|id| id.to_string()).unwrap_or_else(|| "auto".to_string()),
+                    e,
+                )),
             }
         }
 
         if errors.is_empty() {
-            Ok(())
+            Ok(inserted_ids)
         } else {
             Err(errors)
         }
@@ -259,7 +270,10 @@ impl VectorDB {
             // Deserialize the embedding
             let embedding: Vec<f64> = match serde_json::from_str(&embedding_str) {
                 Ok(vec) => vec,
-                Err(_) => continue, // Skip malformed embeddings
+                Err(_) => {
+                    log::warn!("Skipping document {} due to invalid embedding JSON", id);
+                    continue;
+                }
             };
 
             if embedding.len() != query.len() {
@@ -285,8 +299,16 @@ impl VectorDB {
             distances.push((id, distance, metadata, content));
         }
 
-        // Sort by distance and return top N
-        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by distance based on metric
+        match metric {
+            DistanceMetric::DotProduct => {
+                distances.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            }
+            _ => {
+                distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
+
         distances.truncate(n);
         distances
     }
