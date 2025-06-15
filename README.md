@@ -27,6 +27,6 @@ cargo run
 ## TODO
 1. Implement more efficient distance calculations.
 2. Use advanced datastructures for fast nearest neighbor searches.
-3. Test embeddings and retrieved documents search functionality. [here](examples/embeddings_generator.py)
-4. Batch import and Export of Documents: you might need to import or export large numbers of documents.
-5. Dynamic Indexing 
+3. Move from sqlite to other storage.
+4. HNSW algorithm for indexing
+5. Metadata storage for filtering
