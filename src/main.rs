@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use sqlx::Row;
 use env_logger::Env;
 use vectordb::vectorstore::{VectorDB, ShardDB, DistanceMetric};
 
@@ -252,6 +253,36 @@ async fn retrieve_documents(
 }
 
 
+/// Handler to list all collections
+async fn list_collections(
+    db: web::Data<ShardDB>,
+) -> impl Responder {
+    let db = db.lock().unwrap();
+    
+    let rows = sqlx::query("SELECT id, name FROM collections")
+        .fetch_all(&db.pool)
+        .await;
+
+    match rows {
+        Ok(records) => {
+            let collections: Vec<_> = records
+                .into_iter()
+                .map(|row| {
+                    let id: i32 = row.try_get("id").unwrap_or(0);
+                    let name: String = row.try_get("name").unwrap_or_default();
+                    serde_json::json!({"id": id, "name": name})
+                })
+                .collect();
+
+            HttpResponse::Ok().json(collections)
+        },
+        Err(e) => {
+            log::error!("Failed to fetch collections: {}", e);
+            HttpResponse::InternalServerError().body("Failed to fetch collections")
+        }
+    }
+}
+
 /// Ensures that a directory exists, creating it if necessary
 fn ensure_directory(path: &PathBuf) -> std::io::Result<()> {
     if !path.exists() {
@@ -336,6 +367,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(db.clone())) // TODO: Maybe increase payload size ?
             .route("/ping", web::get().to(health_check))
             .route("/create_collection", web::post().to(create_collection))
+            .route("/collections", web::get().to(list_collections))
             .route("/collections/{name}", web::get().to(get_collection_by_name))
             .route("/add_document", web::post().to(add_document))
             .route("/add_documents", web::post().to(add_documents))
