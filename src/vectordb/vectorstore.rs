@@ -1,30 +1,22 @@
-use ndarray::Array1;
+use std::sync::{Arc, RwLock};
+use rocksdb::DB;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use sqlx::Row;
-use std::sync::{Arc, Mutex};
-use std::vec;
+use bincode;
+use hnsw_rs::hnsw::{Hnsw, Neighbour};
+use hnsw_rs::anndists::dist::{DistCosine, DistDot, DistL2};
 
 use crate::AddDocumentRequest;
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct Collection {
-    pub id: i32,
-    pub name: String,
-}
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Document {
-    pub id: i32,
-    pub embedding: Vec<f64>, // Vec<f64> for better serialization
-    pub metadata: String,
-    pub content: String,
-    pub collection_id: i32,
+pub struct Collection {
+    pub id: u64,
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum DistanceMetric {
-    Euclidean,
+    Euclidean, 
     Cosine,
     DotProduct,
 }
@@ -38,189 +30,149 @@ impl DistanceMetric {
             _ => None,
         }
     }
-    
 }
 
+enum MetricIndex<'a> {
+    Cosine(Hnsw<'a, f32, DistCosine>),
+    Dot(Hnsw<'a, f32, DistDot>),
+    Euclidean(Hnsw<'a, f32, DistL2>),
+}
+
+impl<'a> MetricIndex<'a> {
+    fn insert(&mut self, id: usize, emb: &[f32]) {
+        match self {
+            MetricIndex::Cosine(h) => h.insert((emb, id)),
+            MetricIndex::Dot(h) => h.insert((emb, id)),
+            MetricIndex::Euclidean(h) => h.insert((emb, id)),
+        }
+    }
+    
+    fn search(&self, query: &[f32], top_k: usize) -> Vec<Neighbour> {
+        let ef_search = 2 * top_k;
+        match self {
+            MetricIndex::Cosine(h) => h.search(query, top_k, ef_search),
+            MetricIndex::Dot(h) => h.search(query, top_k, ef_search),
+            MetricIndex::Euclidean(h) => h.search(query, top_k, ef_search)
+        }
+    }
+}
 
 #[derive(Clone)]
-pub struct VectorDB {
-    pub pool: SqlitePool,
+pub struct VectorDB <'a> {
+    pub db: Arc<DB>,
+    hnsw: Arc<RwLock<MetricIndex<'a>>>,
+    dimension: usize,
 }
 
+pub type ShardDB<'a> = Arc<RwLock<VectorDB<'a>>>;
 
-impl VectorDB {
-    pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(database_url)
-            .await?;
-
-        // Create collections table if it doesn't exist
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS collections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE
-            );
-            "#,
-        )
-        .execute(&pool)
-        .await?;
-
-        // Create the documents table if it doesn't exist
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY,
-                embedding TEXT NOT NULL,
-                metadata TEXT NOT NULL,
-                content TEXT NOT NULL,
-                collection_id INTEGER NOT NULL,
-                FOREIGN KEY (collection_id) REFERENCES collections(id)
-            );
-            "#,
-        )
-        .execute(&pool)
-        .await?;
-
-        Ok(VectorDB { pool })
-    }  
-
-    /// Creates a new collection
-    pub async fn create_collection(&self, name: &str) -> Result<Collection, String> {
-        // Insert the new collection
-        let result = sqlx::query(
-            r#"
-            INSERT INTO collections (name)
-            VALUES (?)
-            "#,
-        )
-        .bind(name)
-        .execute(&self.pool)
-        .await;
-
-        match result {
-            Ok(res) => {
-                let collection_id = res.last_insert_rowid() as i32;
-                Ok(Collection {
-                    id: collection_id,
-                    name: name.to_string(),
-                })
-            }
-            Err(e) => {
-                if let sqlx::Error::Database(db_err) = &e {
-                    if db_err.message().contains("UNIQUE constraint failed") {
-                        return Err("Collection already exists".to_string());
-                    }
-                }
-                Err(e.to_string())
-            }
+impl<'a> VectorDB<'a> {
+    pub fn new(path: &str, dimension: usize, metric: DistanceMetric) -> Self {
+        let db = Arc::new(DB::open_default(path).expect("rocksdb open failed"));
+        let hnsw = match metric {
+            DistanceMetric::Cosine => MetricIndex::Cosine(Hnsw::<f32, DistCosine>::new(16, 100_000, 10, 200, DistCosine {})),
+            DistanceMetric::DotProduct => MetricIndex::Dot(Hnsw::<f32, DistDot>::new(16, 100_000, 10, 200, DistDot {})),
+            DistanceMetric::Euclidean => MetricIndex::Euclidean(Hnsw::<f32, DistL2>::new(16, 100_000, 10, 200, DistL2 {})),
+        };
+        Self {
+            db,
+            hnsw: Arc::new(RwLock::new(hnsw)),
+            dimension,
         }
     }
 
-    /// Retrieves a collection by name.
-    pub async fn get_collection_by_name(&self, name: &str) -> Result<Collection, String> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, name FROM collections
-            WHERE name = ?
-            "#,
-        )
-        .bind(name)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        Ok(Collection {
-            id: row.try_get("id").unwrap_or(0),
-            name: row.try_get("name").unwrap_or_default(),
-        })
-    }
-
-    /// Check if a collection exists
-    #[allow(dead_code)] // Suppress warning if not used
-    pub async fn collection_exists(&self, name: &str) -> bool {
-        let result = sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT COUNT(*) FROM collections
-            WHERE name = ?
-            "#,
-        )
-        .bind(name)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
-
-        result > 0
-    }
-
-    /// Adds a new document to the database.
-    pub async fn add_document(
-        &self, 
-        id: Option<i32>, 
-        vector: Vec<f64>, 
-        metadata: String, 
-        content: String,
-        collection_id: i32,
-    ) -> Result<i32, String> {
-        // Serialize the embedding vector to JSON string
-        let embedding_json = serde_json::to_string(&vector).map_err(|e| e.to_string())?;
-
-        let query = if let Some(id_val) = id {
-            sqlx::query(
-                r#"
-                INSERT INTO documents (id, embedding, metadata, content, collection_id)
-                VALUES (?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(id_val)
-            .bind(embedding_json)
-            .bind(metadata)
-            .bind(content)
-            .bind(collection_id)
-        } else {
-            sqlx::query(
-                r#"
-                INSERT INTO documents (embedding, metadata, content, collection_id)
-                VALUES (?, ?, ?, ?)
-                "#,
-            )
-            .bind(embedding_json)
-            .bind(metadata)
-            .bind(content)
-            .bind(collection_id)
+    // Create a new collection
+    pub fn create_collection(&self, name: &str) -> Result<Collection, String> {
+        let id = rand::random::<u64>();
+        let collection = Collection {
+            id,
+            name: name.to_string(),
         };
-
-        let result = query.execute(&self.pool).await.map_err(|e| e.to_string())?;
-        let inserted_id  = result.last_insert_rowid() as i32;
-        
-        Ok(inserted_id)
+        let value = serde_json::to_vec(&collection).map_err(|e| e.to_string())?;
+        self.db.put(format!("col:{}", name), value).map_err(|e| e.to_string())?;
+        Ok(collection)
     }
 
-    /// Batch adds multiple documents to the database within a collection
-    pub async fn add_documents(
-        &self,
-        documents: Vec<AddDocumentRequest>,
-        collection_id: i32
-    ) -> Result<Vec<i32>, Vec<String>> {
-        let mut errors = Vec::new();
+    // get collection by name
+    pub fn get_collection_by_name(&self, name: &str) -> Result<Collection, String> {
+        match self.db.get(format!("col:{}", name)) {
+            Ok(Some(bytes)) => {
+                let col: Collection = serde_json::from_slice(&bytes).map_err(|e|e.to_string())?;
+                Ok(col)
+            }
+            Ok(None) => Err("Collection not found".into()),
+            Err(e) => Err(e.to_string()),
+        }
+    }   
+
+    // List Collections
+    pub fn list_collections(&self) -> Result<Vec<Collection>, String> {
+        let mut collections = Vec::new();
+        let prefix = b"col:";
+
+        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+
+        for item in iter {
+            let (k, v) = item.map_err(|e| e.to_string())?;
+            if k.starts_with(prefix) {
+                let collection: Collection = serde_json::from_slice(&v).map_err(|e| e.to_string())?;
+                collections.push(collection);
+            }
+        }
+
+        Ok(collections)
+    }
+
+
+    // Add a single document
+    pub fn add_document(
+        &self, 
+        id: Option<u64>,
+        embedding: Vec<f32>,
+        metadata: String,
+        content: String,
+        _collection_id: u64,
+    ) -> Result<u64, String> {
+        if embedding.len() != self.dimension {
+            return Err("Embedding dimension mismatch".to_string());
+        }
+
+        let doc_id = id.unwrap_or(rand::random::<u64>());
+        self.db.put(format!("vec:{}", doc_id), bincode::serialize(&embedding).unwrap()).map_err(|e| e.to_string())?;
+        self.db.put(format!("meta:{}", doc_id), metadata.as_bytes()).map_err(|e| e.to_string())?;
+        self.db.put(format!("content:{}", doc_id), content.as_bytes()).map_err(|e| e.to_string())?;
+
+        self.hnsw.write().unwrap().insert(doc_id as usize, &embedding);
+        Ok(doc_id)
+    }
+
+    // Add docs in batch
+    pub fn add_documents(
+        &self, 
+        docs: Vec<AddDocumentRequest>,
+        collection_id: u64
+    ) -> Result<Vec<u64>, Vec<String>> {
         let mut inserted_ids = Vec::new();
+        let mut errors = Vec::new();
 
-
-        for doc in documents {
-            match self
-            .add_document(doc.id, doc.embedding, doc.metadata, doc.content, collection_id)
-            .await
-            {
+        for doc in docs {
+            let embedding: Vec<f32> = doc.embedding.iter().map(|v| *v as f32).collect();
+            match self.add_document(
+                doc.id.map(|id| id as u64),
+                embedding,
+                doc.metadata.clone(),
+                doc.content.clone(),
+                collection_id,
+            ) {
                 Ok(id) => inserted_ids.push(id),
                 Err(e) => errors.push(format!(
-                    "Failed to add document ID {}: {}",
-                    doc.id.map(|id| id.to_string()).unwrap_or_else(|| "auto".to_string()),
-                    e,
+                    "Doc ID {:?} failed: {}",
+                    doc.id.unwrap_or(-1),
+                    e 
                 )),
             }
         }
-
+    
         if errors.is_empty() {
             Ok(inserted_ids)
         } else {
@@ -228,91 +180,19 @@ impl VectorDB {
         }
     }
 
-    /// Finds the top N nearest neighbors to a given query vector
-    pub async fn search(
+    pub fn search(
         &self,
-        query: &[f64],
-        n: usize, // top n 
-        metric: DistanceMetric,
-        collection_name: Option<&str>,
-    ) -> Vec<(i32, f64, String, String)> {
-        // Sql for optional metadata filtering
-        let mut query_builder = String::from("SELECT id, embedding, metadata, content FROM documents");
-        if let Some(_filter) = collection_name {
-            query_builder.push_str(" WHERE collection_id = (SELECT id FROM collections WHERE name = ?)");
-        }
-
-        // Execute
-        let rows = if let Some(filter) = collection_name {
-            sqlx::query(&query_builder)
-                .bind(filter)
-                .fetch_all(&self.pool)
-                .await
-                .unwrap_or_else(|_| vec![])
-        } else {
-            sqlx::query(&query_builder)
-                .fetch_all(&self.pool)
-                .await
-                .unwrap_or_else(|_| vec![])
-        };
-
-        let query_vec = Array1::from(query.to_vec());
-
-        // Calculate distance
-        let mut distances = Vec::new();
-
-        for row in rows {
-            let id: i32 = row.try_get("id").unwrap_or(0);
-            let embedding_str: String = row.try_get("embedding").unwrap_or_default();
-            let metadata: String = row.try_get("metadata").unwrap_or_default();
-            let content: String = row.try_get("content").unwrap_or_default();
-
-            // Deserialize the embedding
-            let embedding: Vec<f64> = match serde_json::from_str(&embedding_str) {
-                Ok(vec) => vec,
-                Err(_) => {
-                    log::warn!("Skipping document {} due to invalid embedding JSON", id);
-                    continue;
-                }
-            };
-
-            if embedding.len() != query.len() {
-                continue; // Skip if dimensions mismatch
-            }
-
-            let doc_vec = Array1::from(embedding.clone());
-            let distance = match metric {
-                DistanceMetric::Euclidean => (&query_vec - &doc_vec).mapv(|a| a.powi(2)).sum().sqrt(),
-                DistanceMetric::Cosine => {
-                    let dot_product = query_vec.dot(&doc_vec);
-                    let query_norm = query_vec.mapv(|a| a.powi(2)).sum().sqrt();
-                    let doc_norm = doc_vec.mapv(|a| a.powi(2)).sum().sqrt();
-                    if query_norm == 0.0 || doc_norm == 0.0 {
-                        1.0
-                    } else {
-                        1.0 - (dot_product / (query_norm * doc_norm))
-                    }
-                }
-                DistanceMetric::DotProduct => query_vec.dot(&doc_vec),
-            };
-
-            distances.push((id, distance, metadata, content));
-        }
-
-        // Sort by distance based on metric
-        match metric {
-            DistanceMetric::DotProduct => {
-                distances.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-            }
-            _ => {
-                distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            }
-        }
-
-        distances.truncate(n);
-        distances
+        query: &[f32],
+        top_k: usize,
+        _collection_name: Option<&str>,
+    ) -> Vec<(u64, f32, String, String)> {
+        let results = self.hnsw.read().unwrap().search(query, top_k);
+        results.into_iter().map(|n| {
+            let id = n.d_id as u64;
+            let dist = n.distance;
+            let meta = self.db.get(format!("meta:{}", id)).unwrap().map(|v| String::from_utf8_lossy(&v).to_string()).unwrap_or_default();
+            let content = self.db.get(format!("content:{}", id)).unwrap().map(|v| String::from_utf8_lossy(&v).to_string()).unwrap_or_default();
+            (id, dist, meta, content)
+        }).collect()
     }
 }
-
-/// Type alias for thread-safe, shared VectorDB
-pub type ShardDB = Arc<Mutex<VectorDB>>;
