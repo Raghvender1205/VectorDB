@@ -3,10 +3,9 @@ use actix_web::http::StatusCode;
 use actix_web::middleware::Logger;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use env_logger::Env;
 use vectordb::vectorstore::{VectorDB, ShardDB, DistanceMetric};
 
@@ -15,7 +14,9 @@ mod vectordb;
 
 #[derive(Deserialize, Clone)]
 pub struct CreateCollectionRequest {
-    pub name: String,
+    name: String,
+    metric: String,
+    dimension: usize,
 }
 
 #[derive(Deserialize, Clone)]
@@ -27,98 +28,116 @@ pub struct AddDocumentRequest {
     pub collection_name: String, 
 }
 
-#[derive(Serialize)]
-struct AddDocumentResponse {
-    id: i32,
-    status: String,
-}
-
 #[derive(Deserialize)]
 struct AddDocumentsRequest {
     documents: Vec<AddDocumentRequest>,
 }
 
+#[derive(Deserialize)]
+struct SearchRequest {
+    query: Vec<f64>,
+    n: usize, 
+    collection_name: String,
+}
+
+#[derive(Serialize)]
+struct CollectionResponse {
+    id: u64,
+    name: String,
+    metric: DistanceMetric,
+    dimension: usize,
+}
+
+#[derive(Serialize)]
+struct AddDocumentResponse {
+    id: i32, 
+    status: String,
+}
+
 #[derive(Serialize)]
 struct AddDocumentsResponse {
-    documents: Vec<AddDocumentResponse>
-}
-
-#[derive(Deserialize)]
-pub struct SearchRequest {
-    pub query: Vec<f64>,
-    pub n: usize,
-    pub metric: String, // "Euclidean", "Cosine", "Dot"
-    pub collection_name: String
+    documents: Vec<AddDocumentResponse>,
 }
 
 #[derive(Serialize)]
-pub struct NearestNeighbor {
-    pub id: u64,
-    pub distance: f32,
-    pub metadata: String,
-    pub content: String,
+struct NearestNeighbor {
+    id: u64,
+    distance: f32,
+    metadata: String,
+    content: String
 }
 
-// Healthcheck
+// Health Check
 async fn health_check() -> impl Responder {
     HttpResponse::Ok().body("pong")
 }
 
+fn ensure_directory(path: &PathBuf) -> std::io::Result<()> {
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+    }
+    Ok(())
+}
 
-/// Handler to create a new collection
 async fn create_collection(
     db: web::Data<ShardDB<'static>>,
-    item: web::Json<CreateCollectionRequest>
+    req: web::Json<CreateCollectionRequest>,
 ) -> impl Responder {
-    let db = db.write().unwrap();
-    match db.create_collection(&item.name) {
-        Ok(collection) => HttpResponse::Ok().json(collection),
-        Err(err) => HttpResponse::BadRequest().body(err),
+    let metric = DistanceMetric::from_str(&req.metric)
+        .unwrap_or(DistanceMetric::Cosine);
+
+    match db.create_collection(&req.name, metric.clone(), req.dimension) {
+        Ok(meta) => HttpResponse::Ok().json(CollectionResponse {
+            id: meta.id,
+            name: meta.name,
+            metric,
+            dimension: meta.dim,
+        }),
+        Err(e) if e == "duplicate" => HttpResponse::Conflict().body("Collection exists"),
+        Err(e) => HttpResponse::BadRequest().body(e),
     }
 }
 
-// Handler to get collection by name
+async fn list_collections(db: web::Data<ShardDB<'static>>) -> impl Responder {
+    let list = db.list_collections();
+    let resp: Vec<CollectionResponse> = list
+        .into_iter()
+        .map(|m| CollectionResponse {
+            id: m.id,
+            name: m.name,
+            metric: m.metric,
+            dimension: m.dim,
+        })
+        .collect();
+    HttpResponse::Ok().json(resp)
+}
+
 async fn get_collection_by_name(
     db: web::Data<ShardDB<'static>>,
     path: web::Path<String>,
 ) -> impl Responder {
-    let db = db.write().unwrap();
-
-    match db.get_collection_by_name(&path.into_inner()) {
-        Ok(collection) => HttpResponse::Ok().json(collection),
+    match db.get_collection_by_name(&path) {
+        Ok(m) => HttpResponse::Ok().json(CollectionResponse {
+            id: m.id,
+            name: m.name,
+            metric: m.metric,
+            dimension: m.dim,
+        }),
         Err(_) => HttpResponse::NotFound().body("Collection not found"),
     }
 }
 
-/// Handler to list all collections
-async fn list_collections(
-    db: web::Data<ShardDB<'static>>,
-) -> impl Responder {
-    let db = db.read().unwrap(); // read lock
-    match db.list_collections() {
-        Ok(collections) => HttpResponse::Ok().json(collections),
-        Err(e) => HttpResponse::InternalServerError().body(e),
-    }
-}
-
-/// Handler to add a single document to a collection
 async fn add_document(
     db: web::Data<ShardDB<'static>>,
     item: web::Json<AddDocumentRequest>,
 ) -> impl Responder {
-    let db = db.write().unwrap();
-    let collection = match db.get_collection_by_name(&item.collection_name) {
-        Ok(c)  => c,
-        Err(e) => return HttpResponse::BadRequest().body(format!("Collection not found: {e}")),
-    };
-
-    let embedding: Vec<f32> = item.embedding.iter().map(|&v| v as f32).collect();
+    let emb: Vec<f32> = item.embedding.iter().map(|v| *v as f32).collect();
     match db.add_document(
-        item.id.map(|v| v as u64),                
-        embedding,
+        &item.collection_name,
+        item.id.map(|x| x as u64),
+        emb,
         item.metadata.clone(),
         item.content.clone(),
-        collection.id,
     ) {
         Ok(id) => HttpResponse::Ok().json(AddDocumentResponse {
             id: id as i32,
@@ -128,19 +147,15 @@ async fn add_document(
     }
 }
 
-/// Handler to add multiple documents to a collection
 async fn add_documents(
     db: web::Data<ShardDB<'static>>,
-    item: web::Json<AddDocumentsRequest>,
+    req: web::Json<AddDocumentsRequest>,
 ) -> impl Responder {
-    let db = db.write().unwrap();
-    let collection_name = &item.documents[0].collection_name;
-    let collection = match db.get_collection_by_name(collection_name) {
-        Ok(c) => c,
-        Err(_) => return HttpResponse::BadRequest().body("Collection not found"),
-    };
-
-    match db.add_documents(item.documents.clone(), collection.id) {
+    if req.documents.is_empty() {
+        return HttpResponse::BadRequest().body("No documents");
+    }
+    let col_name = &req.documents[0].collection_name;
+    match db.add_documents(col_name, req.documents.clone()) {
         Ok(ids) => {
             let docs = ids
                 .into_iter()
@@ -151,46 +166,31 @@ async fn add_documents(
                 .collect();
             HttpResponse::Ok().json(AddDocumentsResponse { documents: docs })
         }
-        Err(errors) => HttpResponse::build(StatusCode::MULTI_STATUS).json(json!({ "errors": errors })),
+        Err(errs) => HttpResponse::build(StatusCode::MULTI_STATUS)
+            .json(json!({ "errors": errs })),
     }
 }
 
-
-/// Handler to search for relevant documents within a collection
 async fn retrieve_documents(
     db: web::Data<ShardDB<'static>>,
-    item: web::Json<SearchRequest>,
+    req: web::Json<SearchRequest>,
 ) -> impl Responder {
-    let db = db.read().unwrap();
-    let collection = match db.get_collection_by_name(&item.collection_name) {
-        Ok(c)  => c,
-        Err(_) => return HttpResponse::BadRequest().body("Collection not found"),
-    };
-
-    let query: Vec<f32> = item.query.iter().map(|&v| v as f32).collect();
-    // Search signature is (&self, query, top_k, _collection_name)
-    let hits = db.search(&query, item.n, Some(&collection.name));
-
-    let resp: Vec<NearestNeighbor> = hits
-        .into_iter()
-        .map(|(id, dist, meta, content)| NearestNeighbor {
-            id,
-            distance: dist,
-            metadata: meta,
-            content,
-        })
-        .collect();
-
-    HttpResponse::Ok().json(resp)
-}
-
-
-/// Ensures that a directory exists, creating it if necessary
-fn ensure_directory(path: &PathBuf) -> std::io::Result<()> {
-    if !path.exists() {
-        fs::create_dir_all(path)?;
+    let query: Vec<f32> = req.query.iter().map(|v| *v as f32).collect();
+    match db.search(&req.collection_name, &query, req.n) {
+        Ok(hits) => {
+            let resp: Vec<NearestNeighbor> = hits
+                .into_iter()
+                .map(|(id, dist, meta, content)| NearestNeighbor {
+                    id,
+                    distance: dist,
+                    metadata: meta,
+                    content,
+                })
+                .collect();
+            HttpResponse::Ok().json(resp)
+        }
+        Err(e) => HttpResponse::BadRequest().body(e),
     }
-    Ok(())
 }
 
 
@@ -201,17 +201,7 @@ async fn main() -> std::io::Result<()> {
     let db_path = PathBuf::from("data/rocksdb");
     ensure_directory(&db_path)?;
 
-    // Decide the distance metric once, when db is created 
-    let metric = env::var("VECTOR_METRIC")
-        .ok()
-        .and_then(|m| DistanceMetric::from_str(&m))
-        .unwrap_or(DistanceMetric::Cosine);
-
-    let db: ShardDB<'static> = Arc::new(RwLock::new(VectorDB::new(
-        db_path.to_str().unwrap(),
-        128,                     // <-- vector dimension
-        metric,
-    )));
+    let db: ShardDB<'static> = Arc::new(VectorDB::new(db_path.to_str().unwrap()));
 
     println!("⬢ Vector DB server running on http://127.0.0.1:8444");
 

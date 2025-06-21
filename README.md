@@ -13,7 +13,7 @@ A vector database implementation in Rust. A server and client based codebase. Ju
 - VectorDB Structure: The database is represented by a struct that maps an integer ID to a vector.
 - Add : Allows insertion of vectors into the database
 - Find Nearest: Computes Euclidean distance between a `query` vector and all vectors in the database returning the close one.
-- SQLite based persistence storage
+- RocksDB and HNSW Indexing
 
 ## Usage
 1. Run the server using the following command
@@ -27,6 +27,4 @@ cargo run
 ## TODO
 1. Implement more efficient distance calculations.
 2. Use advanced datastructures for fast nearest neighbor searches.
-3. Move from sqlite to other storage.
-4. HNSW algorithm for indexing
-5. Metadata storage for filtering
+3. Metadata storage for filtering
