@@ -1,318 +1,268 @@
-use ndarray::Array1;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use rocksdb::DB;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use sqlx::Row;
-use std::sync::{Arc, Mutex};
-use std::vec;
+use bincode;
+use hnsw_rs::hnsw::{Hnsw, Neighbour};
+use hnsw_rs::anndists::dist::{DistCosine, DistDot, DistL2};
 
 use crate::AddDocumentRequest;
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct Collection {
-    pub id: i32,
-    pub name: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Document {
-    pub id: i32,
-    pub embedding: Vec<f64>, // Vec<f64> for better serialization
-    pub metadata: String,
-    pub content: String,
-    pub collection_id: i32,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+/* Distance Metric */
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum DistanceMetric {
     Euclidean,
     Cosine,
-    DotProduct,
+    Dot,
 }
 
 impl DistanceMetric {
-    pub fn from_str(metric: &str) -> Option<Self> {
-        match metric.to_lowercase().as_str() {
-            "euclidean" => Some(DistanceMetric::Euclidean),
-            "cosine" => Some(DistanceMetric::Cosine),
-            "dot" => Some(DistanceMetric::DotProduct),
-            _ => None,
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "euclidean" => Some(Self::Euclidean),
+            "cosine" => Some(Self::Cosine),
+            "dot" => Some(Self::Dot),
+            _ => None
         }
     }
-    
 }
 
-
-#[derive(Clone)]
-pub struct VectorDB {
-    pub pool: SqlitePool,
+/* HNSW Enum */
+enum MetricIndex<'a> {
+    Cosine(Hnsw<'a, f32, DistCosine>),
+    Dot(Hnsw<'a, f32, DistDot>),
+    Euclidean(Hnsw<'a, f32, DistL2>),
 }
 
-
-impl VectorDB {
-    pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(database_url)
-            .await?;
-
-        // Create collections table if it doesn't exist
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS collections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE
-            );
-            "#,
-        )
-        .execute(&pool)
-        .await?;
-
-        // Create the documents table if it doesn't exist
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY,
-                embedding TEXT NOT NULL,
-                metadata TEXT NOT NULL,
-                content TEXT NOT NULL,
-                collection_id INTEGER NOT NULL,
-                FOREIGN KEY (collection_id) REFERENCES collections(id)
-            );
-            "#,
-        )
-        .execute(&pool)
-        .await?;
-
-        Ok(VectorDB { pool })
-    }  
-
-    /// Creates a new collection
-    pub async fn create_collection(&self, name: &str) -> Result<Collection, String> {
-        // Insert the new collection
-        let result = sqlx::query(
-            r#"
-            INSERT INTO collections (name)
-            VALUES (?)
-            "#,
-        )
-        .bind(name)
-        .execute(&self.pool)
-        .await;
-
-        match result {
-            Ok(res) => {
-                let collection_id = res.last_insert_rowid() as i32;
-                Ok(Collection {
-                    id: collection_id,
-                    name: name.to_string(),
-                })
-            }
-            Err(e) => {
-                if let sqlx::Error::Database(db_err) = &e {
-                    if db_err.message().contains("UNIQUE constraint failed") {
-                        return Err("Collection already exists".to_string());
-                    }
-                }
-                Err(e.to_string())
-            }
+impl<'a> MetricIndex<'a> {
+    // embed to vectordb
+    fn insert(&mut self, id: usize, emb: &[f32]) {
+        match self {
+            Self::Cosine(h) => h.insert((emb, id)),
+            Self::Dot(h) => h.insert((emb, id)),
+            Self::Euclidean(h) => h.insert((emb, id)), 
         }
     }
 
-    /// Retrieves a collection by name.
-    pub async fn get_collection_by_name(&self, name: &str) -> Result<Collection, String> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, name FROM collections
-            WHERE name = ?
-            "#,
-        )
-        .bind(name)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Search through
+    fn search(&self, query: &[f32], top_k: usize) -> Vec<Neighbour> {
+        let ef_search = 2 * top_k;
+        match self {
+            Self::Cosine(h) => h.search(query, top_k, ef_search),
+            Self::Dot(h) => h.search(query, top_k, ef_search),
+            Self::Euclidean(h) => h.search(query, top_k, ef_search),
+        }
+    }
+}
 
-        Ok(Collection {
-            id: row.try_get("id").unwrap_or(0),
-            name: row.try_get("name").unwrap_or_default(),
-        })
+/* Collection Meta & CollectionEntry */
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CollectionMeta {
+    pub id: u64,
+    pub name: String,
+    pub dim: usize,
+    pub metric: DistanceMetric
+}
+
+// Holds meta + its own index
+pub struct CollectionEntry<'a> {
+    pub meta: CollectionMeta,
+    index: RwLock<MetricIndex<'a>>,
+}
+
+/* VectorDB */
+pub struct VectorDB<'a> {
+    db: Arc<DB>,
+    collections: RwLock<HashMap<String, Arc<CollectionEntry<'a>>>>,
+}
+
+pub type ShardDB<'a> = Arc<VectorDB<'a>>;
+
+
+/* Implementations */
+impl<'a> VectorDB<'a> {
+    pub fn new(path: &str) -> Self  {
+        let db = Arc::new(DB::open_default(path).expect("rocksdb open failed"));
+        Self {
+            db,
+            collections: RwLock::new(HashMap::new()),
+        }
     }
 
-    /// Check if a collection exists
-    #[allow(dead_code)] // Suppress warning if not used
-    pub async fn collection_exists(&self, name: &str) -> bool {
-        let result = sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT COUNT(*) FROM collections
-            WHERE name = ?
-            "#,
-        )
-        .bind(name)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
-
-        result > 0
-    }
-
-    /// Adds a new document to the database.
-    pub async fn add_document(
+    // Create a new Collection
+    pub fn create_collection(
         &self, 
-        id: Option<i32>, 
-        vector: Vec<f64>, 
-        metadata: String, 
-        content: String,
-        collection_id: i32,
-    ) -> Result<i32, String> {
-        // Serialize the embedding vector to JSON string
-        let embedding_json = serde_json::to_string(&vector).map_err(|e| e.to_string())?;
-
-        let query = if let Some(id_val) = id {
-            sqlx::query(
-                r#"
-                INSERT INTO documents (id, embedding, metadata, content, collection_id)
-                VALUES (?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(id_val)
-            .bind(embedding_json)
-            .bind(metadata)
-            .bind(content)
-            .bind(collection_id)
-        } else {
-            sqlx::query(
-                r#"
-                INSERT INTO documents (embedding, metadata, content, collection_id)
-                VALUES (?, ?, ?, ?)
-                "#,
-            )
-            .bind(embedding_json)
-            .bind(metadata)
-            .bind(content)
-            .bind(collection_id)
-        };
-
-        let result = query.execute(&self.pool).await.map_err(|e| e.to_string())?;
-        let inserted_id  = result.last_insert_rowid() as i32;
-        
-        Ok(inserted_id)
-    }
-
-    /// Batch adds multiple documents to the database within a collection
-    pub async fn add_documents(
-        &self,
-        documents: Vec<AddDocumentRequest>,
-        collection_id: i32
-    ) -> Result<Vec<i32>, Vec<String>> {
-        let mut errors = Vec::new();
-        let mut inserted_ids = Vec::new();
-
-
-        for doc in documents {
-            match self
-            .add_document(doc.id, doc.embedding, doc.metadata, doc.content, collection_id)
-            .await
-            {
-                Ok(id) => inserted_ids.push(id),
-                Err(e) => errors.push(format!(
-                    "Failed to add document ID {}: {}",
-                    doc.id.map(|id| id.to_string()).unwrap_or_else(|| "auto".to_string()),
-                    e,
-                )),
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(inserted_ids)
-        } else {
-            Err(errors)
-        }
-    }
-
-    /// Finds the top N nearest neighbors to a given query vector
-    pub async fn search(
-        &self,
-        query: &[f64],
-        n: usize, // top n 
+        name: &str,
         metric: DistanceMetric,
-        collection_name: Option<&str>,
-    ) -> Vec<(i32, f64, String, String)> {
-        // Sql for optional metadata filtering
-        let mut query_builder = String::from("SELECT id, embedding, metadata, content FROM documents");
-        if let Some(_filter) = collection_name {
-            query_builder.push_str(" WHERE collection_id = (SELECT id FROM collections WHERE name = ?)");
+        dim: usize
+    ) -> Result<CollectionMeta, String> {
+        if self.collections.read().unwrap().contains_key(name) {
+            return Err("duplicate".into());
         }
 
-        // Execute
-        let rows = if let Some(filter) = collection_name {
-            sqlx::query(&query_builder)
-                .bind(filter)
-                .fetch_all(&self.pool)
-                .await
-                .unwrap_or_else(|_| vec![])
-        } else {
-            sqlx::query(&query_builder)
-                .fetch_all(&self.pool)
-                .await
-                .unwrap_or_else(|_| vec![])
+        let id = rand::random::<u64>();
+        let meta = CollectionMeta {
+            id, 
+            name: name.to_string(),
+            dim,
+            metric: metric.clone(),
         };
 
-        let query_vec = Array1::from(query.to_vec());
-
-        // Calculate distance
-        let mut distances = Vec::new();
-
-        for row in rows {
-            let id: i32 = row.try_get("id").unwrap_or(0);
-            let embedding_str: String = row.try_get("embedding").unwrap_or_default();
-            let metadata: String = row.try_get("metadata").unwrap_or_default();
-            let content: String = row.try_get("content").unwrap_or_default();
-
-            // Deserialize the embedding
-            let embedding: Vec<f64> = match serde_json::from_str(&embedding_str) {
-                Ok(vec) => vec,
-                Err(_) => {
-                    log::warn!("Skipping document {} due to invalid embedding JSON", id);
-                    continue;
-                }
-            };
-
-            if embedding.len() != query.len() {
-                continue; // Skip if dimensions mismatch
+        // Build HNSW index for the collection
+        let hnsw = match metric {
+            DistanceMetric::Cosine => {
+                MetricIndex::Cosine(Hnsw::<f32, DistCosine>::new(16, 100_000, 10, 200, DistCosine {}))
             }
-
-            let doc_vec = Array1::from(embedding.clone());
-            let distance = match metric {
-                DistanceMetric::Euclidean => (&query_vec - &doc_vec).mapv(|a| a.powi(2)).sum().sqrt(),
-                DistanceMetric::Cosine => {
-                    let dot_product = query_vec.dot(&doc_vec);
-                    let query_norm = query_vec.mapv(|a| a.powi(2)).sum().sqrt();
-                    let doc_norm = doc_vec.mapv(|a| a.powi(2)).sum().sqrt();
-                    if query_norm == 0.0 || doc_norm == 0.0 {
-                        1.0
-                    } else {
-                        1.0 - (dot_product / (query_norm * doc_norm))
-                    }
-                }
-                DistanceMetric::DotProduct => query_vec.dot(&doc_vec),
-            };
-
-            distances.push((id, distance, metadata, content));
-        }
-
-        // Sort by distance based on metric
-        match metric {
-            DistanceMetric::DotProduct => {
-                distances.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            DistanceMetric::Dot => {
+                MetricIndex::Dot(Hnsw::<f32, DistDot>::new(16, 100_000, 10, 200, DistDot {}))
             }
-            _ => {
-                distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            DistanceMetric::Euclidean => {
+                MetricIndex::Euclidean(Hnsw::<f32, DistL2>::new(16, 100_000, 10, 200, DistL2 {}))
             }
-        }
+        };
 
-        distances.truncate(n);
-        distances
+        let entry = Arc::new(CollectionEntry { meta: meta.clone(), index: RwLock::new(hnsw) });
+        self.collections.write().unwrap().insert(name.to_string(), entry);
+
+        // Persist the meta
+        self.db
+            .put(format!("col:{}", name), serde_json::to_vec(&meta).unwrap())
+            .map_err(|e| e.to_string())?;
+
+        Ok(meta)
     }
-}
 
-/// Type alias for thread-safe, shared VectorDB
-pub type ShardDB = Arc<Mutex<VectorDB>>;
+    // Get collection by name
+    pub fn get_collection_by_name(&self, name: &str) -> Result<CollectionMeta, String> {
+        self.collections
+            .read()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .map(|e| e.meta.clone())
+            .ok_or_else(|| "Collection not found".into())
+    }
+
+    pub fn list_collections(&self) -> Vec<CollectionMeta> {
+        self.collections
+            .read()
+            .unwrap()
+            .values()
+            .map(|e| e.meta.clone())
+            .collect()
+    }
+
+    // Add a single Document
+    pub fn add_document(
+        &self,
+        col_name: &str,
+        id: Option<u64>,
+        embedding: Vec<f32>,
+        metadata: String,
+        content: String,
+    ) -> Result<u64, String> {
+        let entry = self
+            .collections
+            .read()
+            .unwrap()
+            .get(col_name)
+            .cloned()
+            .ok_or_else(|| "Collection not found".to_lowercase())?;
+
+        if embedding.len() != entry.meta.dim {
+            return Err("Embedding dimension mismatch".into());
+        }
+
+        let doc_id = id.unwrap_or(rand::random::<u64>());
+        let key_prefix = format!("{}:{}", entry.meta.id, doc_id);
+
+        self.db
+            .put(
+                format!("vec:{}", key_prefix),
+                bincode::serialize(&embedding).unwrap()
+            )
+            .and_then(|_| self.db.put(format!("meta:{}", key_prefix), metadata.as_bytes()))
+            .and_then(|_| self.db.put(format!("content:{}", key_prefix), content.as_bytes()))
+            .map_err(|e| e.to_string())?;
+            
+        entry.index.write().unwrap().insert(doc_id as usize, &embedding);
+        Ok(doc_id)
+    }
+
+
+    // Add documents in a batch
+    pub fn add_documents(
+        &self, 
+        col_name: &str,
+        docs: Vec<AddDocumentRequest>,
+    ) -> Result<Vec<u64>, Vec<String>> {
+        let mut ok_ids = Vec::new();
+        let mut errs = Vec::new();
+
+        for d in docs {
+            let emb: Vec<f32> = d.embedding.iter().map(|v| *v as f32).collect();
+            match self.add_document(
+                col_name,
+                d.id.map(|x| x as u64),
+                emb,
+                d.metadata.clone(),
+                d.content.clone(),
+            ) {
+                Ok(id) => ok_ids.push(id),
+                Err(e) => errs.push(format!("Doc: {:?}: {e}", d.id)),
+            }
+        }
+
+        if errs.is_empty() {
+            Ok(ok_ids)
+        } else {
+            Err(errs)
+        }
+    }
+
+    // Similarity Search
+    pub fn search(
+        &self, 
+        col_name: &str,
+        query: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<(u64, f32, String, String)>, String> {
+        let entry = self
+            .collections
+            .read()
+            .unwrap()
+            .get(col_name)
+            .cloned()
+            .ok_or_else(|| "Collection not found".to_string())?;
+    
+        if query.len() != entry.meta.dim {
+            return Err("Query dimension mismatch".into());
+        }
+
+        let hits = entry.index.read().unwrap().search(query, top_k);
+        let mut out = Vec::new();
+        
+        for n in hits {
+            let id = n.d_id as u64;
+            let key_prefix = format!("{}:{}", entry.meta.id, id);
+            let meta = self
+                .db
+                .get(format!("meta:{}", key_prefix))
+                .unwrap()
+                .map(|v| String::from_utf8_lossy(&v).into())
+                .unwrap_or_default();
+
+            let content = self
+                .db
+                .get(format!("content:{}", key_prefix))
+                .unwrap()
+                .map(|v| String::from_utf8_lossy(&v).into())
+                .unwrap_or_default();
+
+            out.push((id, n.distance, meta, content));
+        }
+        Ok(out)
+    }
+
+}
