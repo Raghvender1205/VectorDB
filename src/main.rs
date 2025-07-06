@@ -11,6 +11,14 @@ use vectordb::vectorstore::{VectorDB, ShardDB, DistanceMetric};
 
 mod vectordb;
 
+#[cfg(feature = "profiling")]
+use mimalloc::MiMalloc;
+
+#[cfg(feature = "profiling")]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+
 
 #[derive(Deserialize, Clone)]
 pub struct CreateCollectionRequest {
@@ -46,6 +54,7 @@ struct CollectionResponse {
     name: String,
     metric: DistanceMetric,
     dimension: usize,
+    doc_count: u64
 }
 
 #[derive(Serialize)]
@@ -67,9 +76,27 @@ struct NearestNeighbor {
     content: String
 }
 
+#[derive(Serialize)]
+struct HealthResponse {
+    status: String,
+    version: String,
+    uptime_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct StatsResponse {
+    collections: usize,
+    total_documents: usize,
+    memory_usage: std::collections::HashMap<String, usize>,
+}
+
 // Health Check
 async fn health_check() -> impl Responder {
-    HttpResponse::Ok().body("pong")
+    HttpResponse::Ok().json(HealthResponse {
+        status: "healthy".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_seconds: 0, // You can implement proper uptime tracking
+    })
 }
 
 fn ensure_directory(path: &PathBuf) -> std::io::Result<()> {
@@ -92,9 +119,16 @@ async fn create_collection(
             name: meta.name,
             metric,
             dimension: meta.dim,
+            doc_count: meta.doc_count
         }),
-        Err(e) if e == "duplicate" => HttpResponse::Conflict().body("Collection exists"),
-        Err(e) => HttpResponse::BadRequest().body(e),
+        Err(e) if e == "duplicate" => HttpResponse::Conflict().json(json!({
+            "error": "Collection already exists",
+            "collection_name": req.name
+        })),
+        Err(e) => HttpResponse::BadRequest().json(json!({
+            "error": e,
+            "collection_name": req.name
+        })),
     }
 }
 
@@ -107,6 +141,7 @@ async fn list_collections(db: web::Data<ShardDB<'static>>) -> impl Responder {
             name: m.name,
             metric: m.metric,
             dimension: m.dim,
+            doc_count: m.doc_count
         })
         .collect();
     HttpResponse::Ok().json(resp)
@@ -122,8 +157,12 @@ async fn get_collection_by_name(
             name: m.name,
             metric: m.metric,
             dimension: m.dim,
+            doc_count: m.doc_count
         }),
-        Err(_) => HttpResponse::NotFound().body("Collection not found"),
+        Err(_) => HttpResponse::NotFound().json(json!({
+            "error": "Collection not found",
+            "collection_name": path.as_str()
+        })),
     }
 }
 
@@ -143,7 +182,10 @@ async fn add_document(
             id: id as i32,
             status: "success".into(),
         }),
-        Err(e) => HttpResponse::BadRequest().body(e),
+        Err(e) => HttpResponse::BadRequest().json(json!({
+            "error": e,
+            "collection_name": item.collection_name
+        })),
     }
 }
 
@@ -152,8 +194,11 @@ async fn add_documents(
     req: web::Json<AddDocumentsRequest>,
 ) -> impl Responder {
     if req.documents.is_empty() {
-        return HttpResponse::BadRequest().body("No documents");
+        return HttpResponse::BadRequest().json(json!({
+            "error": "No documents provided"
+        }));
     }
+
     let col_name = &req.documents[0].collection_name;
     match db.add_documents(col_name, req.documents.clone()) {
         Ok(ids) => {
@@ -167,7 +212,10 @@ async fn add_documents(
             HttpResponse::Ok().json(AddDocumentsResponse { documents: docs })
         }
         Err(errs) => HttpResponse::build(StatusCode::MULTI_STATUS)
-            .json(json!({ "errors": errs })),
+            .json(json!({ 
+                "errors": errs,
+                "collection_name": col_name
+            })),
     }
 }
 
@@ -189,7 +237,40 @@ async fn retrieve_documents(
                 .collect();
             HttpResponse::Ok().json(resp)
         }
-        Err(e) => HttpResponse::BadRequest().body(e),
+        Err(e) => HttpResponse::BadRequest().json(json!({
+            "error": e,
+            "collection_name": req.collection_name
+        })),
+    }
+}
+
+async fn get_stats(db: web::Data<ShardDB<'static>>) -> impl Responder {
+    let collections = db.list_collections();
+    let total_docs: u64 = collections.iter().map(|c| c.doc_count).sum();
+    
+    let memory_stats = db.get_memory_stats();
+    
+    HttpResponse::Ok().json(StatsResponse {
+        collections: collections.len(),
+        total_documents: total_docs as usize,
+        memory_usage: memory_stats,
+    })
+}
+
+async fn memory_profile() -> impl Responder {
+    #[cfg(feature = "profiling")]
+    {
+        HttpResponse::Ok().json(json!({
+            "message": "Memory profiling available via mimalloc",
+            "allocator": "mimalloc",
+            "instructions": "Compile with --features profiling to enable mimalloc allocator"
+        }))
+    }
+    #[cfg(not(feature = "profiling"))]
+    {
+        HttpResponse::NotImplemented().json(json!({
+            "error": "Profiling not enabled. Compile with --features profiling"
+        }))
     }
 }
 
@@ -202,13 +283,30 @@ async fn main() -> std::io::Result<()> {
     ensure_directory(&db_path)?;
 
     let db: ShardDB<'static> = Arc::new(VectorDB::new(db_path.to_str().unwrap()));
+    let workers = num_cpus::get();
 
     println!("⬢ Vector DB server running on http://127.0.0.1:8444");
+    println!("⬢ Workers: {}", workers);
+    println!("⬢ Database path: {}", db_path.display());
 
     HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
             .app_data(web::Data::new(db.clone()))
+            .app_data(web::PayloadConfig::new(50 * 1024 * 1024)) // 50MB payload limit
+            .service(
+                web::scope("/api/v1")
+                    .route("/health", web::get().to(health_check))
+                    .route("/stats", web::get().to(get_stats))
+                    .route("/profile", web::get().to(memory_profile))
+                    .route("/collections", web::post().to(create_collection))
+                    .route("/collections", web::get().to(list_collections))
+                    .route("/collections/{name}", web::get().to(get_collection_by_name))
+                    .route("/documents", web::post().to(add_document))
+                    .route("/documents/batch", web::post().to(add_documents))
+                    .route("/search", web::post().to(retrieve_documents))
+            )
+            // Legacy routes for backward compatibility
             .route("/ping", web::get().to(health_check))
             .route("/create_collection", web::post().to(create_collection))
             .route("/collections", web::get().to(list_collections))
@@ -217,6 +315,8 @@ async fn main() -> std::io::Result<()> {
             .route("/add_documents", web::post().to(add_documents))
             .route("/search", web::post().to(retrieve_documents))
     })
+    .worker_max_blocking_threads(workers * 4)
+    .workers(workers)
     .bind(("127.0.0.1", 8444))?
     .run()
     .await

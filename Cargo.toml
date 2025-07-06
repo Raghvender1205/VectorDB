@@ -16,3 +16,16 @@ log = "0.4.22"
 rocksdb = "0.23.0"
 bincode = "1.3.3"
 hnsw_rs = "0.3"
+num_cpus = "1.17.0"
+rayon = "1.10.0"
+arc-swap = "1.7.1"
+rkyv = { version = "0.7", features = ["validation"] }
+
+[features]
+default = []
+profiling = ["mimalloc"]
+
+[dependencies.mimalloc]
+version = "0.1"
+optional = true
+
