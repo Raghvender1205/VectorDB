@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vector DB Dashboard</title>
+    <link rel="stylesheet" href="/dashboard/dashboard.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Vector DB Dashboard</h1>
+            <div class="stats" id="stats">
+                <div class="stat-item">
+                    <div class="stat-value">0</div>
+                    <div>Collections</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">0</div>
+                    <div>Documents</div>
+                </div>
+            </div>
+        </header>
+        
+        <div class="tabs">
+            <button class="tab-button active" onclick="showTab('collections')">Collections</button>
+            <button class="tab-button" onclick="showTab('documents')">Documents</button>
+            <button class="tab-button" onclick="showTab('search')">Search</button>
+            <button class="tab-button" onclick="showTab('console')">Console</button>
+        </div>
+
+        <div id="collections" class="tab-content active">
+            <h2>Collections</h2>
+            <button onclick="showCreateCollection()">Create Collection</button>
+            <div id="collections-list">
+                <p>Loading collections...</p>
+            </div>
+            
+            <div id="create-collection-modal" class="modal" style="display: none;">
+                <div class="modal-content">
+                    <h3>Create Collection</h3>
+                    <input type="text" id="collection-name" placeholder="Collection Name">
+                    <select id="collection-metric">
+                        <option value="cosine">Cosine</option>
+                        <option value="euclidean">Euclidean</option>
+                        <option value="dot">Dot Product</option>
+                    </select>
+                    <input type="number" id="collection-dimension" placeholder="Dimension" value="768">
+                    <button onclick="createCollection()">Create</button>
+                    <button onclick="hideCreateCollection()">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="documents" class="tab-content">
+            <h2>Documents</h2>
+            <select id="doc-collection-select">
+                <option value="">Select a collection</option>
+            </select>
+            <div id="documents-list">
+                <p>Select a collection to view documents</p>
+            </div>
+            <button onclick="loadDocuments()">Load Documents</button>
+        </div>
+
+        <div id="search" class="tab-content">
+            <h2>Search</h2>
+            <select id="search-collection-select">
+                <option value="">Select a collection</option>
+            </select>
+            <textarea id="search-query" placeholder="Enter embedding as comma-separated values (e.g., 0.1, 0.2, 0.3, ...)"></textarea>
+            <input type="number" id="search-limit" placeholder="Top K" value="10">
+            <button onclick="performSearch()">Search</button>
+            <div id="search-results"></div>
+        </div>
+
+        <div id="console" class="tab-content">
+            <h2>API Console</h2>
+            <div class="console-input">
+                <select id="console-method">
+                    <option value="GET">GET</option>
+                    <option value="POST">POST</option>
+                </select>
+                <input type="text" id="console-endpoint" placeholder="/api/v1/collections" value="/api/v1/collections">
+                <button onclick="executeConsoleCommand()">Execute</button>
+            </div>
+            <textarea id="console-body" placeholder="Request body (JSON)" rows="5"></textarea>
+            <textarea id="console-output" readonly rows="10"></textarea>
+        </div>
+    </div>
+
+    <script src="/dashboard/dashboard.js"></script>
+</body>
+</html>

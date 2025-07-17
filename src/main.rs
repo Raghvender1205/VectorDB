@@ -1,8 +1,10 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, HttpResponse, HttpServer, Responder, Result};
 use actix_web::http::StatusCode;
 use actix_web::middleware::Logger;
+use mime_guess::from_path;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use rust_embed::RustEmbed;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +20,9 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-
+#[derive(RustEmbed)]
+#[folder = "src/dashboard/"]
+struct Dashboard;
 
 #[derive(Deserialize, Clone)]
 pub struct CreateCollectionRequest {
@@ -274,6 +278,34 @@ async fn memory_profile() -> impl Responder {
     }
 }
 
+async fn serve_dashboard() -> Result<HttpResponse> {
+    match Dashboard::get("index.html") {
+        Some(content) => {
+            let body = content.data.into_owned();
+            Ok(HttpResponse::Ok()
+                .content_type("text/html; charset=utf-8")
+                .body(body))
+        }
+        None => Ok(HttpResponse::NotFound().body("Dashboard not found")),
+    }
+}
+
+async fn serve_dashboard_assets(path: web::Path<String>) -> Result<HttpResponse> {
+    let filename = path.into_inner();
+    
+    match Dashboard::get(&filename) {
+        Some(content) => {
+            let body = content.data.into_owned();
+            let mime_type = from_path(&filename).first_or_octet_stream();
+            
+            Ok(HttpResponse::Ok()
+                .content_type(mime_type.as_ref())
+                .body(body))
+        }
+        None => Ok(HttpResponse::NotFound().body("File not found")),
+    }
+}
+
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -306,6 +338,10 @@ async fn main() -> std::io::Result<()> {
                     .route("/documents/batch", web::post().to(add_documents))
                     .route("/search", web::post().to(retrieve_documents))
             )
+            // dashboard
+            .route("/dashboard", web::get().to(serve_dashboard))
+            .route("/dashboard/", web::get().to(serve_dashboard))
+            .route("/dashboard/{filename:.*}", web::get().to(serve_dashboard_assets))
             // Legacy routes for backward compatibility
             .route("/ping", web::get().to(health_check))
             .route("/create_collection", web::post().to(create_collection))
