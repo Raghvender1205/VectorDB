@@ -1,6 +1,6 @@
 # VectorDB
 <div align="center">
-    <img src="assets/logo.png" width="400" />
+    <img src="src/dashboard/assets/logo.png" width="400" />
 </div>
 
 
